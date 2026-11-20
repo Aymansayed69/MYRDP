@@ -1,4 +1,18 @@
-name: win 11 + tailscale + Download.bat script 
+# GitHub Actions workflow (rename to .yml and place in .github/workflows/)
+#
+# REQUIRED REPOSITORY SECRETS (Settings > Secrets and variables > Actions):
+#   TAILSCALE_AUTHKEY - a Tailscale auth key (prefer a reusable one)
+#   RDP_PASSWORD      - the password for the local "RDP" account
+#
+# Security notes / changes from the original:
+#   - NLA is now ENABLED (set UserAuthentication/SecurityLayer to 0 only if your
+#     RDP client cannot handle NLA).
+#   - Port 3389 is restricted to Tailscale's 100.64.0.0/10 range.
+#   - Credentials are no longer hardcoded or printed in plaintext to the log.
+#   - The RDP account is still added to Administrators (needed for a full
+#     desktop) - remove that line if you do not need admin rights.
+
+name: win 11 + tailscale + Download.bat script
 
 on:
   workflow_dispatch:
@@ -11,36 +25,51 @@ jobs:
     steps:
       - name: Configure Core RDP Settings
         run: |
-          # Enable Remote Desktop and disable Network Level Authentication (if needed)
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-                             -Name "fDenyTSConnections" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                             -Name "UserAuthentication" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                             -Name "SecurityLayer" -Value 0 -Force
+          # Enable Remote Desktop
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+
+          # Keep Network Level Authentication (NLA) enabled for security.
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 1 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 2 -Force
 
           # Remove any existing rule with the same name to avoid duplication
           netsh advfirewall firewall delete rule name="RDP-Tailscale"
-         
-          # For testing, allow any incoming connection on port 3389
-          netsh advfirewall firewall add rule name="RDP-Tailscale" `
-            dir=in action=allow protocol=TCP localport=3389
 
-          # (Optional) Restart the Remote Desktop service to ensure changes take effect
+          # Allow RDP only from Tailscale's CGNAT range (not the whole internet)
+          netsh advfirewall firewall add rule name="RDP-Tailscale" `
+            dir=in action=allow protocol=TCP localport=3389 remoteip=100.64.0.0/10
+
+          # Restart the Remote Desktop service to ensure changes take effect
           Restart-Service -Name TermService -Force
 
-      - name: Create RDP User with Fixed Password
+      - name: Create RDP User
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
         run: |
-          $password = "MR.English2008"
+          # Pass the secret via env: (not interpolated into the script body).
+          $password = $env:RDP_PASSWORD
+          if ([string]::IsNullOrEmpty($password)) {
+              Write-Error "RDP_PASSWORD secret is not set. Add it under Settings > Secrets and variables > Actions."
+              exit 1
+          }
+          # Belt-and-braces: make sure the password never appears in logs.
+          Write-Host "::add-mask::$password"
+
+          # LocalAccounts cmdlets normally autoload; import explicitly if needed.
+          if (-not (Get-Command Get-LocalUser -ErrorAction SilentlyContinue)) {
+              Import-Module Microsoft.PowerShell.LocalAccounts -ErrorAction Stop
+          }
+
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
           if (-not (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue)) {
-              New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+              New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires -PasswordNeverExpires
           }
           Add-LocalGroupMember -Group "Administrators" -Member "RDP"
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
-         
+
+          # The value is masked, so writing it to GITHUB_ENV is safe.
           echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
-         
+
           if (-not (Get-LocalUser -Name "RDP")) {
               Write-Error "User creation failed"
               exit 1
@@ -50,74 +79,98 @@ jobs:
         run: |
           $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
           $installerPath = "$env:TEMP\tailscale.msi"
-         
+
           Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
-          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          $proc = Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait -PassThru
+          # 3010 = "success, reboot required" - acceptable with /norestart.
+          if ($proc.ExitCode -notin 0, 3010) {
+              Write-Error "Tailscale MSI install failed with exit code $($proc.ExitCode)"
+              exit 1
+          }
           Remove-Item $installerPath -Force
 
       - name: Establish Tailscale Connection
+        env:
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
         run: |
-          # Bring up Tailscale with the provided auth key and set a unique hostname
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTHKEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
-         
-          # Wait for Tailscale to assign an IP
+          if ([string]::IsNullOrEmpty($env:TAILSCALE_AUTHKEY)) {
+              Write-Error "TAILSCALE_AUTHKEY secret is not set."
+              exit 1
+          }
+
+          # Bring up Tailscale with the auth key and a unique hostname.
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=$env:TAILSCALE_AUTHKEY --hostname=gh-runner-$env:GITHUB_RUN_ID
+
+          # Wait for Tailscale to assign a single IPv4 address.
           $tsIP = $null
           $retries = 0
           while (-not $tsIP -and $retries -lt 10) {
-              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+              $ipOutput = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4 2>$null
+              if ($ipOutput) {
+                  $tsIP = ($ipOutput | Select-Object -First 1).Trim()
+              }
               Start-Sleep -Seconds 5
               $retries++
           }
-         
+
           if (-not $tsIP) {
               Write-Error "Tailscale IP not assigned. Exiting."
               exit 1
           }
           echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
-     
+
       - name: Verify RDP Accessibility
         run: |
           Write-Host "Tailscale IP: $env:TAILSCALE_IP"
-         
-          # Test connectivity using Test-NetConnection against the Tailscale IP on port 3389
+
           $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
           if (-not $testResult.TcpTestSucceeded) {
               Write-Error "TCP connection to RDP port 3389 failed"
               exit 1
           }
-          Write-Host "TCP connectivity successful!"
+          Write-Host "[OK] TCP connectivity successful!"
 
       - name: Maintain Connection + Watch RDP User
         run: |
           Write-Host "`n=== RDP ACCESS ==="
-          Write-Host "Address: $env:TAILSCALE_IP"
-          Write-Host "Username: RDP"
-          Write-Host "Password: $(echo $env:RDP_CREDS)"
+          Write-Host "Address:     $env:TAILSCALE_IP"
+          Write-Host "Credentials: $env:RDP_CREDS"
           Write-Host "==================`n"
 
-          $rdpProfile = "C:\Users\RDP"
+          # WARNING: this downloads and runs a batch file from an external URL.
+          # Only do this if you trust the source; ideally verify a checksum.
+          $rdpProfile  = "C:\Users\RDP"
           $startupPath = "$rdpProfile\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup"
           $downloadUrl = "https://gitlab.com/MR.English2008/pcme_rdp/-/raw/main/Downloads.bat"
           $downloadPath = "$startupPath\Downloads.bat"
 
+          $maxAttempts = 10
+          $attempt = 0
+
           while ($true) {
               if (Test-Path $rdpProfile) {
+                  $attempt++
                   try {
                       if (-not (Test-Path $startupPath)) {
                           New-Item -ItemType Directory -Path $startupPath -Force | Out-Null
                       }
 
                       Invoke-WebRequest -Uri $downloadUrl -OutFile $downloadPath -UseBasicParsing
-                      Write-Host "? Downloads.bat copied to $downloadPath"
+                      Write-Host "[OK] Downloads.bat copied to $downloadPath"
 
-                      # Run the batch file for the first time
-                      cmd /c $downloadPath
-                      Write-Host "? Downloads.bat executed successfully"
+                      # Quote explicitly: the path contains "Start Menu" (a space).
+                      cmd /c "`"$downloadPath`""
+                      Write-Host "[OK] Downloads.bat executed successfully"
                       break
                   }
                   catch {
-                      Write-Host "? Error copying or executing Downloads.bat: $($_.Exception.Message)"
-                      break
+                      Write-Host "[ERROR] Copy/execute failed (attempt $attempt/$maxAttempts): $($_.Exception.Message)"
+                      if ($attempt -ge $maxAttempts) {
+                          Write-Error "Giving up after $maxAttempts failed attempts."
+                          exit 1
+                      }
+                      Start-Sleep -Seconds 30
+                      continue
                   }
               }
               else {
